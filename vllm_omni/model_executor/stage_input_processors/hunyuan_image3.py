@@ -110,10 +110,25 @@ def _truncate_at_cot_end(generated_text: str) -> str:
     `<answer><boi><img_size_*><img_ratio_*>` is consumed via height/width
     extraction and must not leak into DiT's prompt builder.
     """
-    for marker in ("</recaption>", "</think>"):
-        idx = generated_text.find(marker)
-        if idx != -1:
-            return generated_text[: idx + len(marker)]
+    # Prefer the clean </recaption> close.
+    idx = generated_text.find("</recaption>")
+    if idx != -1:
+        return generated_text[: idx + len("</recaption>")]
+    # Recaption opened but not closed (e.g. greedy ends with EOS instead of
+    # </recaption>): still feed the recaption content to the DiT — cut before
+    # the first image-layout token if present, else keep everything. Falling
+    # back to </think> here (the old behaviour) would drop the visual
+    # description entirely and feed the DiT only the reasoning text.
+    if "<recaption>" in generated_text:
+        for tok in ("<answer>", "<boi>", "<img_size", "<img_ratio"):
+            j = generated_text.find(tok)
+            if j != -1:
+                return generated_text[:j]
+        return generated_text
+    # No recaption at all -> fall back to the think block.
+    idx = generated_text.find("</think>")
+    if idx != -1:
+        return generated_text[: idx + len("</think>")]
     return generated_text
 
 
