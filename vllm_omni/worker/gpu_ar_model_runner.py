@@ -74,6 +74,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # FIX(quality-bisection): HunyuanImage's AR uses a prefer_model_sampler
+        # (the stage-transition forcer </think>-><recaption>) that needs the
+        # decoded-token history. vLLM only populates
+        # sampling_metadata.output_token_ids — and runs the async commit that
+        # fills it with real ids — when a request declares it needs token ids,
+        # which custom model samplers don't advertise. Force it on so the
+        # forcer's history is materialized instead of staying [-1, -1, ...].
+        try:
+            self.input_batch.logitsprocs_need_output_token_ids = True
+        except Exception:
+            pass
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
