@@ -153,7 +153,26 @@ def retrieve_timesteps(
         timesteps = scheduler.timesteps
         num_inference_steps = len(timesteps)
     else:
-        scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
+        # HF parity: HunyuanImage-3 uses its own FlowMatchDiscreteScheduler whose grid is
+        #   sigmas = linspace(1, 0, n+1); sigmas = sd3_shift(sigmas); timesteps = sigmas[:-1]*1000
+        # (sd3_shift(t) = shift*t / (1 + (shift-1)*t), applied once; reverse=True so no flip).
+        # diffusers' FlowMatchEulerDiscreteScheduler default `num_inference_steps` path instead
+        # builds a linspace over the ALREADY-shifted sigma_max..sigma_min endpoints and then
+        # applies the shift a SECOND time, which diverges from HF starting at step 1 (e.g. 8-step
+        # HF=[1000,954.5,900,...] vs diffusers=[1000,947.5,882.8,...]). Feeding the *unshifted*
+        # linspace sigmas explicitly makes diffusers apply the SD3 shift exactly once and reproduce
+        # HF's timesteps bit-for-bit (and the trailing sigma=0, so meanflow t_next on the final
+        # step integrates to 0, matching HF get_timestep_r = timesteps_full[step_index+1]).
+        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+        if (
+            num_inference_steps is not None
+            and accept_sigmas
+            and not getattr(scheduler.config, "use_dynamic_shifting", False)
+        ):
+            hf_sigmas = torch.linspace(1, 0, num_inference_steps + 1)[:-1].tolist()
+            scheduler.set_timesteps(sigmas=hf_sigmas, device=device, **kwargs)
+        else:
+            scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
         timesteps = scheduler.timesteps
     return timesteps, num_inference_steps
 
@@ -612,6 +631,7 @@ class ImageInfo:
 
         self.add_timestep_token = kwargs.get("add_timestep_token", True)
         self.add_guidance_token = kwargs.get("add_guidance_token", False)
+        self.add_timestep_r_token = kwargs.get("add_timestep_r_token", False)
         self.use_front_boi_token = kwargs.get("use_front_boi_token", True)
         self.add_image_shape_token = kwargs.get("add_image_shape_token", True)
 
@@ -649,6 +669,7 @@ class ImageInfo:
                 token_length=self.image_token_length,
                 add_timestep_token=self.add_timestep_token,
                 add_guidance_token=self.add_guidance_token,
+                add_timestep_r_token=self.add_timestep_r_token,
                 use_front_boi_token=self.use_front_boi_token,
                 add_image_shape_token=self.add_image_shape_token,
                 base_size=self.base_size,
@@ -1418,7 +1439,7 @@ class HunyuanImage3ImageProcessor:
         )
         self.vision_encoder_processor = Siglip2ImageProcessorFast.from_dict(config.vit_processor)
 
-    def build_image_info(self, image_size):
+    def build_image_info(self, image_size, add_guidance_token=False, add_timestep_r_token=False):
         # parse image size (HxW, H:W, or <img_ratio_i>)
         if isinstance(image_size, str):
             if image_size.startswith("<img_ratio_"):
@@ -1454,6 +1475,8 @@ class HunyuanImage3ImageProcessor:
             token_height=token_height,
             base_size=base_size,
             ratio_index=ratio_idx,
+            add_guidance_token=add_guidance_token,
+            add_timestep_r_token=add_timestep_r_token,
         )
         return image_info
 
@@ -2635,6 +2658,14 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
     # corresponds to doing no classifier free guidance.
     @property
     def do_classifier_free_guidance(self):
+        # Distilled checkpoints (cfg_distilled=true) bake the guidance scale into a
+        # <guidance> token and run a SINGLE forward instead of classic batch-doubled
+        # CFG. self.model is the HunyuanImage3Pipeline (passed as model=self), which
+        # carries the flag. Mirrors HF modeling_hunyuan_image_3.py:2746-2748
+        # (cfg_factor['gen_image']=1). The guidance value itself is kept on
+        # self._guidance_scale / the guidance_scale property for the <guidance> emb.
+        if getattr(self.model, "cfg_distilled", False):
+            return False
         return self._guidance_scale > 1.0
 
     @property
@@ -2660,6 +2691,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             "position_ids",
             "image_mask",
             "gen_timestep_scatter_index",
+            "guidance_scatter_index",
+            "gen_timestep_r_scatter_index",
             "cond_vae_image_mask",
             "cond_vit_image_mask",
             "cond_timestep_scatter_index",
@@ -2830,9 +2863,22 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         model_kwargs["attention_mask"] = model_kwargs["attention_mask"][:, :, positive_reuse_len:, :]
         model_kwargs["position_ids"] = model_kwargs["position_ids"][:, positive_reuse_len:]
 
-        # Shift image_mask and gen_timestep_scatter_index to match truncated sequence
+        # Shift image_mask and the meta-token scatter indices to match truncated sequence.
+        # The <timestep>/<guidance>/<timestep_r> meta tokens live in the gen-image block (after
+        # the truncated text prefix), so every present scatter index must be shifted by the same
+        # amount or it points positive_reuse_len positions too far right (wrong-position scatter,
+        # or out-of-bounds scatter_ -> CUDA device assert). guidance/timestep_r indices only exist
+        # on the cfg_distilled/use_meanflow path, so guard them with `is not None`.
         model_kwargs["image_mask"] = model_kwargs["image_mask"][:, positive_reuse_len:]
         model_kwargs["gen_timestep_scatter_index"] = model_kwargs["gen_timestep_scatter_index"] - positive_reuse_len
+        if model_kwargs.get("guidance_scatter_index") is not None:
+            model_kwargs["guidance_scatter_index"] = (
+                model_kwargs["guidance_scatter_index"] - positive_reuse_len
+            )
+        if model_kwargs.get("gen_timestep_r_scatter_index") is not None:
+            model_kwargs["gen_timestep_r_scatter_index"] = (
+                model_kwargs["gen_timestep_r_scatter_index"] - positive_reuse_len
+            )
         model_kwargs["ar_kv_reuse_offset"] = positive_reuse_len
 
         # cond-image have computed in ar, we may skip it by index in the future.
@@ -3075,6 +3121,35 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     latent_model_input = torch.cat([latents] * cfg_factor)
 
                 t_expand = t.repeat(latent_model_input.shape[0])
+
+                # --- cfg_distilled: bake the guidance scale into the <guidance> token ---
+                if getattr(self.model, "cfg_distilled", False):
+                    # HF feeds guidance_emb (a TimestepEmbedder, 0..1000 input scale) the
+                    # value 1000.0 * guidance_scale; the x1000 is REQUIRED
+                    # (hunyuan_image_3_pipeline.py:844).
+                    model_kwargs["guidance"] = torch.full(
+                        (latent_model_input.shape[0],),
+                        1000.0 * self._guidance_scale,
+                        device=latent_model_input.device,
+                        dtype=torch.bfloat16,
+                    )
+                    model_kwargs["guidance_scatter_index"] = model_kwargs.get("guidance_scatter_index")
+                else:
+                    model_kwargs["guidance"] = None
+                    model_kwargs["guidance_scatter_index"] = None
+
+                # --- use_meanflow: <timestep_r> = NEXT timestep (integrate-to target) ---
+                if getattr(self.model, "use_meanflow", False):
+                    # HF: scheduler.get_timestep_r(t) = timesteps_full[step_index+1];
+                    # diffusers' FlowMatchEulerDiscreteScheduler has no timesteps_full, so
+                    # the next entry is timesteps[i+1], and the FINAL step integrates to 0
+                    # (the appended sigma=0).
+                    t_next = timesteps[i + 1] if (i + 1) < len(timesteps) else t.new_zeros(())
+                    model_kwargs["timesteps_r"] = t_next.repeat(latent_model_input.shape[0])
+                    model_kwargs["gen_timestep_r_scatter_index"] = model_kwargs.get("gen_timestep_r_scatter_index")
+                else:
+                    model_kwargs["timesteps_r"] = None
+                    model_kwargs["gen_timestep_r_scatter_index"] = None
 
                 # ---- TeaCache: decide whether to compute or reuse ----
                 should_compute = True

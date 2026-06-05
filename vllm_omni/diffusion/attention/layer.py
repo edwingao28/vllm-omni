@@ -254,11 +254,11 @@ class Attention(nn.Module):
         return out
 
     def _run_local_attention(self, query, key, value, attn_metadata):
-        if query.dtype == torch.float32:
-            logger.warning_once(
-                f"Only SDPA supports float32. Overriding user config {type(self.attention)} "
-                f"attention_backend='{self.backend_pref}' to 'sdpa' for dtype={query.dtype}."
-            )
+        # HY_FORCE_SDPA=1 forces the sdpa kernel for ALL dtypes — a kernel-ablation
+        # A/B knob: at the same seed it isolates the flash/flashinfer-vs-sdpa
+        # numerical contribution to the DiT output (sdpa == HF's attention kernel).
+        import os
+        if os.environ.get("HY_FORCE_SDPA") == "1" or query.dtype == torch.float32:
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
 
         # Fallback to standard attention
