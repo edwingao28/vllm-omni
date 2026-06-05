@@ -35,6 +35,7 @@ class TokenizerEncodeOutput(BaseOutput):
     all_image_slices: list[slice] | None = None
     cond_timestep_scatter_index: torch.Tensor | None = None
     gen_timestep_scatter_index: torch.Tensor | None = None
+    gen_timestep_r_scatter_index: torch.Tensor | None = None
     think_recaption_end_pos: list[int | None] | list[list[int | None]] | None = None
     uncond_cfg_start_pos: list[int | None] | None = None
 
@@ -200,6 +201,7 @@ class TokenizerWrapper:
         ratio_idx=None,
         image_type=None,
         add_guidance_token=False,
+        add_timestep_r_token=False,
     ):
         if add_image_shape_token:
             token_seq.extend(
@@ -221,6 +223,10 @@ class TokenizerWrapper:
             token_seq.extend([self.special_token_map["<guidance>"]])
             extra_token_pos["guidance"].append(token_count)
             token_count += 1
+        if add_timestep_r_token:
+            token_seq.extend([self.special_token_map["<timestep_r>"]])
+            extra_token_pos["gen_timestep_r"].append(token_count)
+            token_count += 1
         return token_count
 
     def encode_sequence(
@@ -230,6 +236,7 @@ class TokenizerWrapper:
         total_length=None,
         add_timestep_token=False,
         add_guidance_token=False,
+        add_timestep_r_token=False,
         last_key_only_prefix=False,
         add_eos=True,
         use_front_boi_token=True,
@@ -329,6 +336,7 @@ class TokenizerWrapper:
                     2
                     + (1 if source.get("timestep", add_timestep_token) else 0)
                     + (1 if source.get("guidance", add_guidance_token) else 0)
+                    + (1 if source.get("timestep_r", add_timestep_r_token) else 0)
                     + (2 if source.get("image_shape", add_image_shape_token) else 0)
                 )
                 if drop_last is True and token_count + extra_count + source["length"] > total_length:
@@ -344,6 +352,7 @@ class TokenizerWrapper:
                     extra_token_pos=extra_token_pos,
                     add_timestep_token=source.get("timestep", add_timestep_token),
                     add_guidance_token=source.get("guidance", add_guidance_token),
+                    add_timestep_r_token=source.get("timestep_r", add_timestep_r_token),
                     add_image_shape_token=source.get("image_shape", add_image_shape_token),
                     base_size=source.get("base_size"),
                     ratio_idx=source.get("ratio_idx"),
@@ -739,6 +748,7 @@ class TokenizerWrapper:
                         length=section["token_length"],
                         timestep=section.get("add_timestep_token", False),
                         guidance=section.get("add_guidance_token", False),
+                        timestep_r=section.get("add_timestep_r_token", False),
                         front_boi=section.get("use_front_boi_token", False),
                         image_shape=section.get("add_image_shape_token", False),
                         base_size=section.get("base_size"),
@@ -785,6 +795,11 @@ class TokenizerWrapper:
         gen_timestep_scatter_index = (
             torch.tensor(extra_token_pos["gen_timestep"], dtype=torch.long)
             if "gen_timestep" in extra_token_pos
+            else None
+        )
+        gen_timestep_r_scatter_index = (
+            torch.tensor(extra_token_pos["gen_timestep_r"], dtype=torch.long)
+            if "gen_timestep_r" in extra_token_pos
             else None
         )
 
@@ -860,6 +875,7 @@ class TokenizerWrapper:
             all_image_slices=all_image_slices,
             cond_timestep_scatter_index=cond_timestep_scatter_index,
             gen_timestep_scatter_index=gen_timestep_scatter_index,
+            gen_timestep_r_scatter_index=gen_timestep_r_scatter_index,
             think_recaption_end_pos=think_recaption_end_pos,
             uncond_cfg_start_pos=uncond_cfg_start_pos,
         )
